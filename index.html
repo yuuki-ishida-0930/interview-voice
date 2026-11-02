@@ -68,6 +68,7 @@
   // 録音時間の表示（録音中は大きく、止めたら「録音 0:45」と小さく残す）
   let startedAt = 0;
   let tickId = null;
+  let totalMs = 0;   // 録音した時間の合計（「続けて話す」の分も足す）。話す速さの計算用に元の画面へ送る
 
   function formatTime(ms) {
     const s = Math.floor(ms / 1000);
@@ -92,6 +93,7 @@
     } else if (tickId) {
       clearInterval(tickId);
       tickId = null;
+      totalMs += Date.now() - startedAt;
       $('elapsed').textContent = '録音 ' + formatTime(Date.now() - startedAt);
       $('elapsed').classList.add('done');
     }
@@ -162,14 +164,16 @@
 
   $('retryBtn').addEventListener('click', () => {
     finalText = '';
+    totalMs = 0;
     render('');
     $('elapsed').classList.add('hidden');
     $('micBtn').textContent = '🎤 タップして話す';
   });
 
   $('doneBtn').addEventListener('click', () => {
+    const ms = totalMs + (listening ? Date.now() - startedAt : 0);
     stopListening();
-    if (!send({ type: 'VOICE_RESULT', text: finalText })) {
+    if (!send({ type: 'VOICE_RESULT', text: finalText, seconds: Math.round(ms / 1000) })) {
       showMsg('練習画面に送れませんでした。練習画面から開き直してください。');
       return;
     }
