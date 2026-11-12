@@ -129,7 +129,7 @@
       if (e.error === 'no-speech' || e.error === 'aborted') return;   // 無音や中断では止めずに続ける
       stopping = true;
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        showMsg('マイクまたは音声入力が許可されていません。iPhone は「設定」の Safari で「マイク」を許可し、「設定」→「一般」→「キーボード」で「音声入力」をオンにしてください。');
+        showMsg('マイクまたは音声入力が許可されていません。iPhone・iPad は「設定」→「プライバシーとセキュリティ」→「音声認識」で Safari をオンにし、「設定」の Safari で「マイク」を許可し、「設定」→「一般」→「キーボード」で「音声入力」をオンにしてください。');
       } else {
         showMsg('音声入力でエラーが出ました（' + e.error + '）。もう一度お試しください。');
       }
