@@ -56,8 +56,36 @@
   let listening = false;
   let stopping = false;   // 利用者が止めたか、エラーで止めるべきか（false なら無音で切れても再開する）
   let finalText = '';
+  let restarts = 0;       // 無音などで切れて、自動でつなぎ直した回数（うまくいかなかったときの手がかり）
 
   function showMsg(t) { $('msg').textContent = t || ''; }
+
+  // うまくいかなかったことを練習画面に知らせる（話した文字は送らない。種類と秒数・字数だけ）。
+  // 練習画面に送れないときは、この端末に残して、次に開いたときにまとめて送る
+  const PENDING_KEY = 'voicePending';
+  function stamp() {
+    const d = new Date();
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  function readPending() {
+    try { const a = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  }
+  function keepPending(kind, detail) {
+    try {
+      const a = readPending();
+      a.push({ kind: kind, detail: (detail ? detail + '・' : '') + stamp() + ' のこと' });
+      localStorage.setItem(PENDING_KEY, JSON.stringify(a.slice(-10)));
+    } catch (e) { /* 残せなくても、音声入力は続ける */ }
+  }
+  function canSend() {
+    try { return !!(window.opener && !window.opener.closed && APP_ORIGIN); } catch (e) { return false; }
+  }
+  function report(kind, detail) {
+    if (canSend()) send({ type: 'VOICE_EVENT', kind: kind, detail: detail || '' });
+    else keepPending(kind, detail);
+  }
+  function recSeconds() { return Math.round((totalMs + (listening ? Date.now() - startedAt : 0)) / 1000); }
+  function recDetail() { return '録音' + recSeconds() + '秒・' + finalText.length + '字' + (restarts ? '・つなぎ直し' + restarts + '回' : ''); }
 
   function render(interim) {
     $('final').textContent = finalText;
@@ -100,8 +128,8 @@
   }
 
   function send(message) {
-    if (!window.opener || !APP_ORIGIN) return false;
-    window.opener.postMessage(message, APP_ORIGIN);
+    if (!canSend()) return false;
+    try { window.opener.postMessage(message, APP_ORIGIN); } catch (e) { return false; }
     return true;
   }
 
@@ -128,6 +156,7 @@
     recognizer.onerror = e => {
       if (e.error === 'no-speech' || e.error === 'aborted') return;   // 無音や中断では止めずに続ける
       stopping = true;
+      report('error', e.error + '・' + recDetail());
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         showMsg('マイクまたは音声入力が許可されていません。iPhone・iPad は「設定」→「プライバシーとセキュリティ」→「音声認識」で Safari をオンにし、「設定」の Safari で「マイク」を許可し、「設定」→「一般」→「キーボード」で「音声入力」をオンにしてください。');
       } else {
@@ -136,7 +165,10 @@
     };
     recognizer.onend = () => {
       if (!stopping) {
-        try { recognizer.start(); return; } catch (err) { /* 再開できないときは止める */ }
+        try { recognizer.start(); restarts++; return; } catch (err) {
+          // 再開できないときは止める
+          report('restartFailed', (err && err.name || '') + '・' + recDetail());
+        }
       }
       setMic(false);
       render('');
@@ -159,12 +191,14 @@
       setMic(true);
     } catch (e) {
       showMsg('音声入力を開始できません。');
+      report('startFailed', e && e.name || '');
     }
   });
 
   $('retryBtn').addEventListener('click', () => {
     finalText = '';
     totalMs = 0;
+    restarts = 0;
     render('');
     $('elapsed').classList.add('hidden');
     $('micBtn').textContent = '🎤 タップして話す';
@@ -173,7 +207,8 @@
   $('doneBtn').addEventListener('click', () => {
     const ms = totalMs + (listening ? Date.now() - startedAt : 0);
     stopListening();
-    if (!send({ type: 'VOICE_RESULT', text: finalText, seconds: Math.round(ms / 1000) })) {
+    if (!send({ type: 'VOICE_RESULT', text: finalText, seconds: Math.round(ms / 1000), restarts: restarts })) {
+      keepPending('sendFailed', recDetail());
       showMsg('練習画面に送れませんでした。練習画面から開き直してください。');
       return;
     }
@@ -182,7 +217,9 @@
   });
 
   $('cancelBtn').addEventListener('click', () => {
+    const detail = recDetail();
     stopListening();
+    report('cancel', detail);
     window.close();
     showMsg('練習画面に戻ってください。');
   });
@@ -190,12 +227,18 @@
   if (!window.opener || !APP_ORIGIN) {
     showMsg('このページは、面接練習アプリの「音声で答える」ボタンから開いてください。');
     $('micBtn').disabled = true;
+    keepPending('noOpener', !window.opener ? '開いた元の画面がない' : '送り先が違う');
   } else if (!SR) {
     showMsg('このブラウザは音声入力に対応していません。iPhone は Safari、PC は Chrome か Edge で開いてください。');
     $('micBtn').disabled = true;
+    report('unsupported', '');
   } else {
     setup();
-    send({ type: 'VOICE_READY' });
+    // 前に送れなかった記録があれば、一緒に送る（送れたら消す）
+    const pending = readPending();
+    if (send({ type: 'VOICE_READY', pending: pending }) && pending.length) {
+      try { localStorage.removeItem(PENDING_KEY); } catch (e) {}
+    }
   }
 </script>
 </body>
