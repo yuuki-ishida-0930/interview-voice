@@ -43,7 +43,7 @@
   <p class="note">話した内容は、この画面から練習画面に直接送られます。どこにも保存されません。</p>
 </div>
 <script>
-  // 面接練習アプリ（Google Apps Script）の音声入力用ページ。
+  // 推薦ナビ（旧：面接練習アプリ。Google Apps Script）の音声入力用ページ。
   // Apps Script の画面は埋め込み表示のためマイクが使えない。このページで音声を文字にして、開いた元の画面に送り返す。
   // 質問データや API キーは持たない。文字は postMessage で元の画面にだけ渡し、保存しない。
   const $ = id => document.getElementById(id);
@@ -225,7 +225,7 @@
   });
 
   if (!window.opener || !APP_ORIGIN) {
-    showMsg('このページは、面接練習アプリの「音声で答える」ボタンから開いてください。');
+    showMsg('このページは、推薦ナビ（面接練習）の「音声で答える」ボタンから開いてください。');
     $('micBtn').disabled = true;
     keepPending('noOpener', !window.opener ? '開いた元の画面がない' : '送り先が違う');
   } else if (!SR) {
