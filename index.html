@@ -19,7 +19,7 @@
   .row { display: flex; gap: 8px; }
   .row button { flex: 1; }
   .msg { font-size: .9rem; color: #b00020; margin-top: 10px; line-height: 1.6; }
-  .note { font-size: .8rem; color: #666; margin-top: 10px; }
+  .note { font-size: .8rem; color: #666; margin-top: 10px; line-height: 1.6; }
   .elapsed { font-size: 2.2rem; font-weight: 700; text-align: center; color: #c62828; font-variant-numeric: tabular-nums; margin-top: 12px; }
   .elapsed.done { font-size: 1rem; color: #666; font-weight: 400; }
   .hidden { display: none; }
@@ -41,22 +41,58 @@
   </div>
   <div class="msg" id="msg"></div>
   <p class="note">話した内容は、この画面から練習画面に直接送られます。どこにも保存されません。</p>
+  <p class="note hidden" id="iosTip">押すたびに「マイクへのアクセス」の確認が出るときは、「設定」→「アプリ」→「Safari」→「マイク」を「許可」にすると、出なくなります（iOS 17 までは「設定」→「Safari」→「マイク」）。</p>
+  <p class="note hidden" id="homeTip">ホーム画面のアイコンから開いた推薦ナビで録音がうまくいかないときは、Safari で推薦ナビを開いて試してください。</p>
 </div>
 <script>
   // 推薦ナビ（旧：面接練習アプリ。Google Apps Script）の音声入力用ページ。
   // Apps Script の画面は埋め込み表示のためマイクが使えない。このページで音声を文字にして、開いた元の画面に送り返す。
   // 質問データや API キーは持たない。文字は postMessage で元の画面にだけ渡し、保存しない。
   const $ = id => document.getElementById(id);
-  const requested = new URLSearchParams(location.search).get('origin') || '';
+  const params = new URLSearchParams(location.search);
+  const requested = params.get('origin') || '';
   // 送り先は Apps Script の画面（*.googleusercontent.com）だけに限る
   const APP_ORIGIN = /^https:\/\/[a-z0-9-]+\.googleusercontent\.com$/.test(requested) ? requested : null;
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+  /*
+   * iPhone・iPad の Safari の音声認識は、続けて聞くモード（continuous）で、録音中の表示のまま文字もエラーも終わりの知らせも来ずに
+   * 固まることがある（2026-11-19 の記録：録音 3〜9 秒・0 字・エラーなし。開発者の報告も多い）。そこで（2026-11-19）
+   *  (1) iPhone・iPad では 1 区切りずつ聞いて、終わったら自動でつなぎ直す（話した文字は足していく）
+   *  (2) 始めてから STUCK_MS たってもマイクが動き出さない（audiostart が来ない）とき、iPhone・iPad でマイクが動いたあと IDLE_MS 何も来ないときは、
+   *      音声認識を作り直して自動でやり直す（MAX_KICKS 回まで。だめなら、もう一度押してもらう）
+   *  (3) 何が起きたか（マイクが動いたか・声を拾ったか・やり直した回数・見送ったエラー）を練習画面に知らせる（話した文字は送らない）
+   */
+  const UA = navigator.userAgent || '';
+  const IS_IOS = /iPhone|iPad|iPod/.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
+  const CONTINUOUS = !IS_IOS;
+  const STUCK_MS = 4000;
+  const IDLE_MS = 12000;
+  const MAX_KICKS = 2;
+
   let recognizer = null;
   let listening = false;
-  let stopping = false;   // 利用者が止めたか、エラーで止めるべきか（false なら無音で切れても再開する）
+  let stopping = false;   // 利用者が止めたか、エラーで止めるべきか（false なら区切りや無音で切れても再開する）
   let finalText = '';
-  let restarts = 0;       // 無音などで切れて、自動でつなぎ直した回数（うまくいかなかったときの手がかり）
+  let restarts = 0;       // 区切りや無音で切れて、自動でつなぎ直した回数
+  let diag = { audio: false, speech: false, kicks: 0, skipped: '', asked: false };   // 何が起きたか（記録の手がかり。asked：押したときマイクの確認が出る状態だった）
+  let runAudio = false;   // いまの 1 回でマイクが動き出したか
+  let lastActivity = 0;
+  let watchId = null;
+  let autoKicks = 0;      // この録音で、自動で作り直した回数
+  let tapAt = 0;
+  let deniedOnce = false;
+  // マイクの許可の状態（'granted'・'prompt'・'denied'。分からなければ null）。確認が出ているあいだはマイクが動き出さないので、
+  // 許可されてから数える（確認で迷っているあいだに作り直すと、確認が何度も出てしまう）
+  let micPerm = null;
+  let permAt = 0;         // 許可になった時刻
+  try {
+    navigator.permissions.query({ name: 'microphone' }).then(st => {
+      micPerm = st.state;
+      st.onchange = () => { micPerm = st.state; if (st.state === 'granted') permAt = Date.now(); };
+    }).catch(() => {});
+  } catch (e) { /* 分からなくても動く */ }
+  const FROM_HOME = params.get('home') === '1';   // ホーム画面に追加したアイコンから開いた練習画面から来た
 
   function showMsg(t) { $('msg').textContent = t || ''; }
 
@@ -85,7 +121,12 @@
     else keepPending(kind, detail);
   }
   function recSeconds() { return Math.round((totalMs + (listening ? Date.now() - startedAt : 0)) / 1000); }
-  function recDetail() { return '録音' + recSeconds() + '秒・' + finalText.length + '字' + (restarts ? '・つなぎ直し' + restarts + '回' : ''); }
+  // 例「録音9秒・0字・マイク○声×・作り直し2」（○×：マイクが動き出したか・声を拾ったか）
+  function recDetail() {
+    return '録音' + recSeconds() + '秒・' + finalText.length + '字' + (restarts ? '・つなぎ直し' + restarts + '回' : '') +
+      '・マイク' + (diag.audio ? '○' : '×') + '声' + (diag.speech ? '○' : '×') +
+      (diag.kicks ? '・作り直し' + diag.kicks : '') + (diag.skipped ? '・' + diag.skipped : '') + (diag.asked ? '・確認あり' : '') + (FROM_HOME ? '・ホーム画面' : '');
+  }
 
   function render(interim) {
     $('final').textContent = finalText;
@@ -136,16 +177,69 @@
   function stopListening() {
     if (listening && recognizer) {
       stopping = true;
+      clearWatch();
       recognizer.stop();
     }
   }
 
+  // 固まっていないか見張る（いまの 1 回を始めたときに呼ぶ）
+  function clearWatch() {
+    if (watchId) { clearInterval(watchId); watchId = null; }
+  }
+  function armWatch() {
+    clearWatch();
+    const runStart = Date.now();
+    runAudio = false;
+    lastActivity = runStart;
+    watchId = setInterval(() => {
+      if (!listening || stopping) { clearWatch(); return; }
+      const now = Date.now();
+      // マイクが動き出すまで待つ時間：許可ずみなら STUCK_MS、確認が出る状態なら長め（許可されたら、そこから STUCK_MS）、分からなければ 10 秒
+      const wait = micPerm === 'granted' ? STUCK_MS : micPerm === 'prompt' ? 20000 : 10000;
+      if (!runAudio && now - Math.max(runStart, permAt) > wait) stuck('マイクが動き出さない', true);
+      else if (IS_IOS && runAudio && now - lastActivity > IDLE_MS) stuck('途中で止まった', false);
+    }, 500);
+  }
+
+  // 固まった音声認識を作り直して、もう一度始める（話した文字は残す）。古いものの知らせは無視する。
+  // count=false（黙って考えているだけかもしれない「途中で止まった」）は、あきらめる回数に数えない
+  function stuck(reason, count) {
+    clearWatch();
+    const old = recognizer;
+    setup();
+    try { old.abort(); } catch (e) { /* 止められなくても、新しいほうで続ける */ }
+    if (!count || autoKicks < MAX_KICKS) {
+      if (count) autoKicks++;
+      diag.kicks++;
+      setTimeout(() => {
+        if (stopping || !listening) return;
+        try { recognizer.start(); armWatch(); } catch (e) { giveUp(reason); }
+      }, 300);
+      return;
+    }
+    giveUp(reason);
+  }
+
+  function giveUp(reason) {
+    stopping = true;
+    clearWatch();
+    report('error', 'stuck（' + reason + '）・' + recDetail());
+    setMic(false);
+    render('');
+    showMsg('マイクがうまく動きませんでした。もう一度「🎤 タップして話す」を押してください。何度も止まるときは、イヤホン（AirPods など）を外す・ほかのアプリやタブの音を止める・Safari で開き直す、を試してください。');
+  }
+
   function setup() {
-    recognizer = new SR();
-    recognizer.lang = 'ja-JP';
-    recognizer.continuous = true;
-    recognizer.interimResults = true;
-    recognizer.onresult = e => {
+    const r = new SR();
+    r.lang = 'ja-JP';
+    r.continuous = CONTINUOUS;
+    r.interimResults = true;
+    r.onaudiostart = () => { if (r !== recognizer) return; runAudio = true; diag.audio = true; lastActivity = Date.now(); };
+    r.onspeechstart = () => { if (r !== recognizer) return; runAudio = true; diag.speech = true; lastActivity = Date.now(); };
+    r.onresult = e => {
+      if (r !== recognizer) return;
+      runAudio = true;
+      lastActivity = Date.now();
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
@@ -153,26 +247,39 @@
       }
       render(interim);
     };
-    recognizer.onerror = e => {
-      if (e.error === 'no-speech' || e.error === 'aborted') return;   // 無音や中断では止めずに続ける
+    r.onerror = e => {
+      if (r !== recognizer) return;
+      if (e.error === 'no-speech' || e.error === 'aborted') { diag.skipped = e.error; return; }   // 無音や中断では止めずに続ける
       stopping = true;
+      clearWatch();
       report('error', e.error + '・' + recDetail());
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      if (e.error === 'not-allowed' && Date.now() - tapAt < 3000 && !deniedOnce) {
+        // 押してすぐの not-allowed は、マイクの確認とぶつかったことが多い（2026-11-18 の記録：1 回目 1 秒で not-allowed、2 回目は届いた）
+        deniedOnce = true;
+        showMsg('マイクの確認が出たら「許可」を押してから、もう一度「🎤 タップして話す」を押してください。');
+      } else if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         showMsg('マイクまたは音声入力が許可されていません。iPhone・iPad は「設定」→「プライバシーとセキュリティ」→「音声認識」で Safari をオンにし、「設定」の Safari で「マイク」を許可し、「設定」→「一般」→「キーボード」で「音声入力」をオンにしてください。');
+      } else if (e.error === 'network') {
+        showMsg('音声入力のサーバーにつながりませんでした。インターネットにつながっているか確かめて、もう一度お試しください（学校の Wi-Fi でうまくいかないときは、モバイル通信でも試してください）。');
+      } else if (e.error === 'audio-capture') {
+        showMsg('マイクが使えませんでした。ほかのアプリやタブがマイクを使っていないか、イヤホン（AirPods など）がつながっていないかを確かめて、もう一度お試しください。');
       } else {
         showMsg('音声入力でエラーが出ました（' + e.error + '）。もう一度お試しください。');
       }
     };
-    recognizer.onend = () => {
+    r.onend = () => {
+      if (r !== recognizer) return;
       if (!stopping) {
-        try { recognizer.start(); restarts++; return; } catch (err) {
+        try { r.start(); restarts++; armWatch(); return; } catch (err) {
           // 再開できないときは止める
           report('restartFailed', (err && err.name || '') + '・' + recDetail());
         }
       }
+      clearWatch();
       setMic(false);
       render('');
     };
+    recognizer = r;
   }
 
   // 元の画面から質問文を受け取って表示する（URL には載せない）
@@ -186,12 +293,24 @@
     if (listening) { stopListening(); return; }
     try {
       stopping = false;
+      autoKicks = 0;
+      tapAt = Date.now();
+      if (micPerm === 'prompt') diag.asked = true;
       showMsg('');
       recognizer.start();
       setMic(true);
+      armWatch();
     } catch (e) {
-      showMsg('音声入力を開始できません。');
-      report('startFailed', e && e.name || '');
+      // 前の音声認識が終わりきっていないときは、作り直してもう一度
+      try {
+        setup();
+        recognizer.start();
+        setMic(true);
+        armWatch();
+      } catch (e2) {
+        showMsg('音声入力を開始できません。');
+        report('startFailed', (e2 && e2.name || '') + '・' + recDetail());
+      }
     }
   });
 
@@ -199,6 +318,7 @@
     finalText = '';
     totalMs = 0;
     restarts = 0;
+    diag = { audio: false, speech: false, kicks: 0, skipped: '', asked: false };
     render('');
     $('elapsed').classList.add('hidden');
     $('micBtn').textContent = '🎤 タップして話す';
@@ -224,6 +344,17 @@
     showMsg('練習画面に戻ってください。');
   });
 
+  // ページを離れるときはマイクを放す（前のページが録音中のまま残って、次に開いたページとマイクを取り合わないように）
+  window.addEventListener('pagehide', () => {
+    if (listening && recognizer) {
+      stopping = true;
+      clearWatch();
+      try { recognizer.abort(); } catch (e) {}
+    }
+  });
+
+  if (IS_IOS) $('iosTip').classList.remove('hidden');
+  if (IS_IOS && FROM_HOME) $('homeTip').classList.remove('hidden');
   if (!window.opener || !APP_ORIGIN) {
     showMsg('このページは、推薦ナビ（面接練習）の「音声で答える」ボタンから開いてください。');
     $('micBtn').disabled = true;
