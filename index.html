@@ -94,6 +94,22 @@
   } catch (e) { /* 分からなくても動く */ }
   const FROM_HOME = params.get('home') === '1';   // ホーム画面に追加したアイコンから開いた練習画面から来た
 
+  // 前の音声のページを閉じてから、このページで初めてマイクを押すまでの秒数（記録の手がかり）。
+  // 2026-11-19 の記録：1 回目は届き、送ってから約 4 秒で開いた 2 回目は「許可」を押しても 0 字。前のページの音声認識が
+  // 止まりきらないうちに次を始めるとマイクが動かないのか、を確かめるため
+  const LAST_CLOSE_KEY = 'voiceLastClose';
+  let prevClose = 0;
+  try { prevClose = Number(localStorage.getItem(LAST_CLOSE_KEY)) || 0; } catch (e) { /* 分からなくても動く */ }
+  let firstTapAt = 0;
+  function markClose() {
+    try { localStorage.setItem(LAST_CLOSE_KEY, String(Date.now())); } catch (e) { /* 残せなくても閉じる */ }
+  }
+  function gapLabel() {
+    if (!prevClose || !firstTapAt) return '';
+    const s = Math.round((firstTapAt - prevClose) / 1000);
+    return s >= 0 && s < 600 ? '・前のページから' + s + '秒' : '';
+  }
+
   function showMsg(t) { $('msg').textContent = t || ''; }
 
   // うまくいかなかったことを練習画面に知らせる（話した文字は送らない。種類と秒数・字数だけ）。
@@ -125,7 +141,7 @@
   function recDetail() {
     return '録音' + recSeconds() + '秒・' + finalText.length + '字' + (restarts ? '・つなぎ直し' + restarts + '回' : '') +
       '・マイク' + (diag.audio ? '○' : '×') + '声' + (diag.speech ? '○' : '×') +
-      (diag.kicks ? '・作り直し' + diag.kicks : '') + (diag.skipped ? '・' + diag.skipped : '') + (diag.asked ? '・確認あり' : '') + (FROM_HOME ? '・ホーム画面' : '');
+      (diag.kicks ? '・作り直し' + diag.kicks : '') + (diag.skipped ? '・' + diag.skipped : '') + (diag.asked ? '・確認あり' : '') + gapLabel() + (FROM_HOME ? '・ホーム画面' : '');
   }
 
   function render(interim) {
@@ -295,6 +311,7 @@
       stopping = false;
       autoKicks = 0;
       tapAt = Date.now();
+      if (!firstTapAt) firstTapAt = tapAt;
       if (micPerm === 'prompt') diag.asked = true;
       showMsg('');
       recognizer.start();
@@ -332,7 +349,7 @@
       showMsg('練習画面に送れませんでした。練習画面から開き直してください。');
       return;
     }
-    window.close();
+    closePage();
     showMsg('送りました。練習画面に戻ってください。');   // 閉じられなかったときの案内
   });
 
@@ -340,17 +357,29 @@
     const detail = recDetail();
     stopListening();
     report('cancel', detail);
-    window.close();
+    closePage();
     showMsg('練習画面に戻ってください。');
   });
 
-  // ページを離れるときはマイクを放す（前のページが録音中のまま残って、次に開いたページとマイクを取り合わないように）
+  // マイクを放す（録音中でなくても。前のページの音声認識が残って、次に開いたページとマイクを取り合わないように）
+  function releaseMic() {
+    if (!recognizer) return;
+    stopping = true;
+    clearWatch();
+    try { recognizer.abort(); } catch (e) { /* 止まっていれば何もしない */ }
+  }
+
+  // 閉じる前にマイクを放し、閉じた時刻を残す。放したあと少し待ってから閉じる
+  function closePage() {
+    markClose();
+    releaseMic();
+    setTimeout(() => window.close(), 300);
+  }
+
+  // ページを離れるときもマイクを放す（閉じるボタンを使わずに閉じた・別のページに変わった）
   window.addEventListener('pagehide', () => {
-    if (listening && recognizer) {
-      stopping = true;
-      clearWatch();
-      try { recognizer.abort(); } catch (e) {}
-    }
+    markClose();
+    releaseMic();
   });
 
   if (IS_IOS) $('iosTip').classList.remove('hidden');
