@@ -23,24 +23,29 @@
   .elapsed { font-size: 2.2rem; font-weight: 700; text-align: center; color: #c62828; font-variant-numeric: tabular-nums; margin-top: 12px; }
   .elapsed.done { font-size: 1rem; color: #666; font-weight: 400; }
   .hidden { display: none; }
+  /* 録音だけの形（mode=rec）：声の大きさ */
+  .meter { height: 12px; background: #e5e7eb; border-radius: 6px; overflow: hidden; margin-top: 12px; }
+  .meter span { display: block; height: 100%; width: 0; background: #16a34a; transition: width .1s; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>音声で答える</h1>
   <div class="question" id="question"></div>
-  <div class="transcript"><span id="final"></span><span class="interim" id="interim"></span></div>
+  <div class="transcript" id="transcriptBox"><span id="final"></span><span class="interim" id="interim"></span></div>
+  <p class="note hidden" id="recNote">「🎤 タップして話す」を押して答え、話し終えたら「録音を終える」を押します。録音を AI が文字にして、練習画面の回答の欄に入れます。</p>
   <div class="elapsed hidden" id="elapsed">0:00</div>
+  <div class="meter hidden" id="meter" aria-hidden="true"><span id="meterBar"></span></div>
   <button id="micBtn">🎤 タップして話す</button>
   <div id="afterButtons">
-    <div class="row">
+    <div class="row" id="afterRow">
       <button class="secondary" id="retryBtn">やり直す</button>
       <button id="doneBtn" disabled>完了して戻る</button>
     </div>
     <button class="secondary" id="cancelBtn">キャンセル</button>
   </div>
   <div class="msg" id="msg"></div>
-  <p class="note">話した内容は、この画面から練習画面に直接送られます。どこにも保存されません。</p>
+  <p class="note" id="saveNote">話した内容は、この画面から練習画面に直接送られます。どこにも保存されません。</p>
   <p class="note hidden" id="iosTip">押すたびに「マイクへのアクセス」の確認が出るときは、「設定」→「アプリ」→「Safari」→「マイク」を「許可」にすると、出なくなります（iOS 17 までは「設定」→「Safari」→「マイク」）。</p>
   <p class="note hidden" id="homeTip">ホーム画面のアイコンから開いた推薦ナビで録音がうまくいかないときは、Safari で推薦ナビを開いて試してください。</p>
 </div>
@@ -93,6 +98,12 @@
     }).catch(() => {});
   } catch (e) { /* 分からなくても動く */ }
   const FROM_HOME = params.get('home') === '1';   // ホーム画面に追加したアイコンから開いた練習画面から来た
+  /*
+   * 録音だけの形（mode=rec。2026-11-20、版 66）：iPhone・iPad の Safari の音声認識は、いったん止まると作り直しても押し直しても戻らなかった
+   * （「初めは録音されるが、途中で認識されなくなった。もう一度押しても無反応」）。そこで音声認識は使わず、マイクの録音（MediaRecorder）だけをして、
+   * 練習画面に送る。練習画面が学校のサーバーに送り、AI（Gemini）が文字にする（録音は保存しない）。練習画面に AI のキーがないときは、この形では開かない
+   */
+  const REC = params.get('mode') === 'rec';
 
   // 前の音声のページを閉じてから、このページで初めてマイクを押すまでの秒数（記録の手がかり）。
   // 2026-11-19 の記録：1 回目は届き、送ってから約 4 秒で開いた 2 回目は「許可」を押しても 0 字。前のページの音声認識が
@@ -354,7 +365,7 @@
   });
 
   $('cancelBtn').addEventListener('click', () => {
-    const detail = recDetail();
+    const detail = REC ? recDetailRec() : recDetail();
     stopListening();
     report('cancel', detail);
     closePage();
@@ -363,6 +374,7 @@
 
   // マイクを放す（録音中でなくても。前のページの音声認識が残って、次に開いたページとマイクを取り合わないように）
   function releaseMic() {
+    if (REC) { recDiscard = true; recStop(); releaseRecMic(); return; }
     if (!recognizer) return;
     stopping = true;
     clearWatch();
@@ -382,18 +394,240 @@
     releaseMic();
   });
 
+  /* ===== 録音だけの形（mode=rec） ===== */
+  const REC_MAX_SEC = 180;   // 3 分で止める（AI に送る大きさの上限のため）
+  let mediaRec = null;
+  let recStream = null;
+  let recChunks = [];
+  let recDiscard = false;    // キャンセル・ページを離れた：送らない
+  let recStopTimer = null;
+  let meter = null;
+
+  function recMime() {
+    const MR = window.MediaRecorder;
+    if (!MR || !MR.isTypeSupported) return '';
+    return ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].filter(t => MR.isTypeSupported(t))[0] || '';
+  }
+  function baseMime(m) { return String(m || '').split(';')[0].trim() || 'audio/mp4'; }
+
+  // 例「録音12秒・マイク○声○・wav」（マイク：録音のデータが来たか、声：声の大きさが動いたか。話した中身は送らない）
+  function recDetailRec(extra) {
+    return '録音' + recSeconds() + '秒・マイク' + (diag.audio ? '○' : '×') + '声' + (diag.speech ? '○' : '×') + (extra ? '・' + extra : '') +
+      (diag.asked ? '・確認あり' : '') + gapLabel() + (FROM_HOME ? '・ホーム画面' : '');
+  }
+
+  // 声の大きさ（緑の帯）。話しているのに動かなければ、マイクに声が届いていない
+  function startMeter(stream, ctx) {
+    try {
+      const src = ctx.createMediaStreamSource(stream);
+      const an = ctx.createAnalyser();
+      an.fftSize = 1024;
+      src.connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      const id = setInterval(() => {
+        an.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
+        const level = Math.min(1, peak / 64);
+        if (level > 0.15) diag.speech = true;
+        $('meterBar').style.width = Math.round(level * 100) + '%';
+      }, 100);
+      meter = { ctx: ctx, id: id };
+      $('meter').classList.remove('hidden');
+    } catch (e) {
+      try { ctx.close(); } catch (e2) { /* 閉じられなくてもよい */ }
+    }
+  }
+  function stopMeter() {
+    if (meter) {
+      clearInterval(meter.id);
+      try { meter.ctx.close(); } catch (e) { /* 閉じられなくてもよい */ }
+      meter = null;
+    }
+    $('meter').classList.add('hidden');
+  }
+  function releaseRecMic() {
+    if (recStream) {
+      recStream.getTracks().forEach(t => { try { t.stop(); } catch (e) { /* 止まっていればよい */ } });
+      recStream = null;
+    }
+    stopMeter();
+  }
+
+  function recStart() {
+    tapAt = Date.now();
+    if (!firstTapAt) firstTapAt = tapAt;
+    if (micPerm === 'prompt') diag.asked = true;
+    showMsg('');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+      showMsg('このブラウザは録音に対応していません。iPhone・iPad は Safari、PC は Chrome か Edge で開いてください。');
+      report('unsupported', '録音（MediaRecorder）なし');
+      return;
+    }
+    // 声の大きさを取る仕組みは、押した操作の中で作る（iPhone はあとから作ると動かない。録音そのものには関係しない）
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx = null;
+    try { if (AC) { ctx = new AC(); if (ctx.resume) ctx.resume(); } } catch (e) { ctx = null; }
+    $('micBtn').disabled = true;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      recStream = stream;
+      const mime = recMime();
+      try { mediaRec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); } catch (e) { mediaRec = new MediaRecorder(stream); }
+      recChunks = [];
+      recDiscard = false;
+      mediaRec.ondataavailable = e => { if (e.data && e.data.size) { recChunks.push(e.data); diag.audio = true; } };
+      mediaRec.onstop = recFinish;
+      mediaRec.start(1000);
+      if (ctx) startMeter(stream, ctx);
+      $('micBtn').disabled = false;
+      setMic(true);
+      recStopTimer = setTimeout(() => {
+        if (mediaRec && mediaRec.state === 'recording') { showMsg('3 分たったので、録音を止めました。'); recStop(); }
+      }, REC_MAX_SEC * 1000);
+    }).catch(err => {
+      $('micBtn').disabled = false;
+      try { if (ctx) ctx.close(); } catch (e) { /* 閉じられなくてもよい */ }
+      const name = (err && err.name) || 'Error';
+      report('error', name + '・' + recDetailRec());
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        showMsg('マイクが許可されていません。確認が出たら「許可」を押してから、もう一度押してください。出ないときは、iPhone・iPad の「設定」→「アプリ」→「Safari」→「マイク」を「確認」か「許可」にしてください。');
+      } else if (name === 'NotFoundError' || name === 'NotReadableError' || name === 'AbortError') {
+        showMsg('マイクが使えませんでした。ほかのアプリやタブがマイクを使っていないか、イヤホン（AirPods など）がつながっていないかを確かめて、もう一度押してください。');
+      } else {
+        showMsg('録音を始められませんでした（' + name + '）。もう一度押してください。');
+      }
+    });
+  }
+
+  function recStop() {
+    clearTimeout(recStopTimer);
+    if (mediaRec && mediaRec.state !== 'inactive') {
+      try { mediaRec.stop(); } catch (e) { /* 止まっていればよい */ }
+    }
+  }
+
+  // 録音が止まったら：マイクを切り、WAV にして（できなければそのまま）練習画面に送って閉じる
+  function recFinish() {
+    clearTimeout(recStopTimer);
+    const mime = (mediaRec && mediaRec.mimeType) || (recChunks[0] && recChunks[0].type) || 'audio/mp4';
+    const blob = new Blob(recChunks, { type: mime });
+    recChunks = [];
+    releaseRecMic();
+    setMic(false);
+    if (recDiscard) return;
+    const seconds = Math.round(totalMs / 1000);
+    if (!blob.size) {
+      report('error', '録音が空・' + recDetailRec());
+      showMsg('録音できませんでした。もう一度「🎤 タップして話す」を押してください。');
+      return;
+    }
+    $('micBtn').disabled = true;
+    $('recNote').textContent = '練習画面に送っています…';
+    toWav16k(blob).catch(() => null).then(wav => blobToBase64(wav || blob).then(data => {
+      const type = wav ? 'audio/wav' : baseMime(mime);
+      if (!send({ type: 'VOICE_AUDIO', data: data, mime: type, seconds: seconds, detail: recDetailRec(wav ? 'wav' : type.replace('audio/', '')) })) {
+        keepPending('sendFailed', recDetailRec());
+        $('micBtn').disabled = false;
+        showMsg('練習画面に送れませんでした。練習画面から開き直してください。');
+        return;
+      }
+      closePage();
+      showMsg('送りました。練習画面に戻ってください。');
+    }));
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ''));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(blob);
+    });
+  }
+
+  // blob.arrayBuffer がない古い Safari もある
+  function blobToArrayBuffer(blob) {
+    if (blob.arrayBuffer) return blob.arrayBuffer();
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(blob);
+    });
+  }
+
+  // 16 kHz・1 チャンネルの WAV にする（AI が確実に読める形。iPhone の録音（mp4）は読めないことがある）。作れなければ null
+  function toWav16k(blob) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!AC || !OAC) return Promise.resolve(null);
+    return blobToArrayBuffer(blob).then(buf => new Promise((resolve, reject) => {
+      const ctx = new AC();
+      const done = (fn, v) => { try { ctx.close(); } catch (e) { /* 閉じられなくてもよい */ } fn(v); };
+      const p = ctx.decodeAudioData(buf, a => done(resolve, a), e => done(reject, e));
+      if (p && p.then) p.then(a => done(resolve, a), e => done(reject, e));
+    })).then(audio => {
+      let rate = 16000;
+      let off;
+      try { off = new OAC(1, Math.max(1, Math.ceil(audio.duration * rate)), rate); } catch (e) {
+        rate = 24000;   // 古い Safari は 16 kHz を作れないことがある
+        off = new OAC(1, Math.max(1, Math.ceil(audio.duration * rate)), rate);
+      }
+      const src = off.createBufferSource();
+      src.buffer = audio;
+      src.connect(off.destination);
+      src.start(0);
+      const r = off.startRendering();
+      return (r && r.then ? r : new Promise(res => { off.oncomplete = e => res(e.renderedBuffer); }))
+        .then(out => new Blob([encodeWav(out.getChannelData(0), rate)], { type: 'audio/wav' }));
+    });
+  }
+
+  // PCM 16 ビット・1 チャンネルの WAV
+  function encodeWav(samples, rate) {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF');
+    v.setUint32(4, 36 + samples.length * 2, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true);
+    v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    str(36, 'data');
+    v.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buf;
+  }
+
+  if (REC) {
+    $('transcriptBox').classList.add('hidden');
+    $('afterRow').classList.add('hidden');
+    $('recNote').classList.remove('hidden');
+    $('saveNote').textContent = '録音は、AI（Gemini）で文字にするために練習画面へ送ります。アプリには保存しません。';
+    $('micBtn').addEventListener('click', () => { if (listening) recStop(); else recStart(); });
+  }
+
   if (IS_IOS) $('iosTip').classList.remove('hidden');
   if (IS_IOS && FROM_HOME) $('homeTip').classList.remove('hidden');
   if (!window.opener || !APP_ORIGIN) {
     showMsg('このページは、推薦ナビ（面接練習）の「音声で答える」ボタンから開いてください。');
     $('micBtn').disabled = true;
     keepPending('noOpener', !window.opener ? '開いた元の画面がない' : '送り先が違う');
-  } else if (!SR) {
+  } else if (!REC && !SR) {
     showMsg('このブラウザは音声入力に対応していません。iPhone は Safari、PC は Chrome か Edge で開いてください。');
     $('micBtn').disabled = true;
     report('unsupported', '');
   } else {
-    setup();
+    if (!REC) setup();
     // 前に送れなかった記録があれば、一緒に送る（送れたら消す）
     const pending = readPending();
     if (send({ type: 'VOICE_READY', pending: pending }) && pending.length) {
